@@ -1,0 +1,16 @@
+{
+  "name": "serverwlcheckerjs",
+  "version": "1.0.0",
+  "description": "Phantom server whitelist checker",
+  "type": "module",
+  "main": "server_wl.js",
+  "scripts": {
+    "start": "node server_wl.js"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
