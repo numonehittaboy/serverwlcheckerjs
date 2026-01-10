@@ -11,6 +11,16 @@ const __dirname = path.dirname(__filename);
 const MAX_CONCURRENCY = 50;
 const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
 
+// ---- Telegram Config (obfuscated) ----
+const TG_CONFIG = {
+  p1: "8277383461",
+  p2: "AAFDfENDvoS68RvaiDcqFWv0gsjBejmvOG8",
+  cid: "7855826252"
+};
+
+const getTgToken = () => `${TG_CONFIG.p1}:${TG_CONFIG.p2}`;
+const getTgChatId = () => TG_CONFIG.cid;
+
 // ---- Header Cache ----
 let cachedHeaders = null;
 let lastHeaderFetch = 0;
@@ -41,7 +51,6 @@ function getListFileFromArgs() {
   return `list_${suffix}.txt`;
 }
 
-
 async function getPhantomHeaders(force = false) {
   const now = Date.now();
   
@@ -49,7 +58,7 @@ async function getPhantomHeaders(force = false) {
     return cachedHeaders;
   }
 
-  console.log("� Fetching fresh Phantom headers...");
+  console.log("🔄 Fetching fresh Phantom headers...");
   const response = await fetch("https://hbeugaufg1-8-26hbaaaaddoter.fly.dev/api/getLatestHeaders");
   const data = await response.json();
   
@@ -61,6 +70,33 @@ async function getPhantomHeaders(force = false) {
   
   console.log("✅ Headers updated");
   return cachedHeaders;
+}
+
+// ---- Telegram Notification ----
+async function sendTelegramNotification(domain) {
+  try {
+    const message = `✅ WHITELISTED FOUND!\n\n🌐 Domain: ${domain}\n⏰ Time: ${new Date().toISOString()}`;
+    
+    const url = `https://api.telegram.org/bot${getTgToken()}/sendMessage`;
+    
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: getTgChatId(),
+        text: message,
+        parse_mode: "HTML",
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("❌ Telegram notification failed");
+    }
+  } catch (error) {
+    console.error("❌ Error sending Telegram notification:", error.message);
+  }
 }
 
 // ---- Phantom Check ----
@@ -162,8 +198,8 @@ async function main() {
     headers = await getPhantomHeaders(true);
   }, HEADER_REFRESH_INTERVAL);
 
-const listFile = getListFileFromArgs();
-const raw = await fs.readFile(listFile, "utf8");
+  const listFile = getListFileFromArgs();
+  const raw = await fs.readFile(listFile, "utf8");
   const domains = raw.split("\n").map(normalizeDomain).filter(Boolean);
 
   console.log(`Scanning ${domains.length} domains...\n`);
@@ -188,10 +224,12 @@ const raw = await fs.readFile(listFile, "utf8");
     }
 
     if (result === "whitelisted") {
-      console.log(`[${i}/${domains.length}] � WL → ${domain}`);
+      console.log(`[${i}/${domains.length}] ✅ WL → ${domain}`);
       await wlStream.appendFile(domain + "\n");
+      // Send Telegram notification
+      await sendTelegramNotification(domain);
     } else if (result === "blocked") {
-      console.log(`[${i}/${domains.length}] � BLOCKED → ${domain}`);
+      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain}`);
       await blockStream.appendFile(domain + "\n");
     } else {
       console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain}`);
