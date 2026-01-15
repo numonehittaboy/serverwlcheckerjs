@@ -9,9 +9,11 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MAX_CONCURRENCY = 50; // Increased for faster scanning
-const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
-const REQUEST_TIMEOUT = 8000; // 8 seconds timeout per request
+const MAX_CONCURRENCY = 15; // Reduced from 50 to avoid rate limits
+const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000;
+const REQUEST_TIMEOUT = 10000; // Increased to 10 seconds
+const MAX_RETRIES = 3; // Number of retry attempts
+const REQUEST_DELAY = 100; // 100ms delay between requests (adaptive)
 
 // ---- Telegram Config (obfuscated) ----
 const TG_CONFIG = {
@@ -162,7 +164,7 @@ async function checkPhantom(domain, headers) {
         responseType: "json",
         http2: true,
         timeout: { request: REQUEST_TIMEOUT },
-        retry: { limit: 0 }, // No retries for speed
+        retry: { limit: 0 },
       }
     );
 
@@ -179,7 +181,6 @@ async function checkPhantom(domain, headers) {
     return "unknown";
 
   } catch (error) {
-    // Check if it's a rate limit or server error
     if (error.response) {
       const statusCode = error.response.statusCode;
       if (statusCode === 429) return "rate_limited";
@@ -189,15 +190,24 @@ async function checkPhantom(domain, headers) {
   }
 }
 
-// ---- Optimized Concurrency Pool ----
-async function runPool(list, worker, limit) {
+// ---- Optimized Concurrency Pool with Adaptive Delay ----
+async function runPool(list, worker, limit, delayMs = 0) {
   const results = [];
   const executing = [];
   let index = 0;
+  let consecutiveRateLimits = 0;
 
   for (const item of list) {
-    const promise = worker(item, index++).then(result => {
+    const promise = worker(item, index++, consecutiveRateLimits).then(result => {
       executing.splice(executing.indexOf(promise), 1);
+      
+      // Track rate limits for adaptive slowing
+      if (result === "rate_limited") {
+        consecutiveRateLimits++;
+      } else if (result !== "error") {
+        consecutiveRateLimits = Math.max(0, consecutiveRateLimits - 1);
+      }
+      
       return result;
     });
 
@@ -207,17 +217,71 @@ async function runPool(list, worker, limit) {
     if (executing.length >= limit) {
       await Promise.race(executing);
     }
+    
+    // Adaptive delay - slow down if hitting rate limits
+    if (delayMs > 0) {
+      const adaptiveDelay = delayMs * (1 + consecutiveRateLimits * 0.5);
+      await sleep(adaptiveDelay);
+    }
   }
 
   return Promise.all(results);
 }
 
+// ---- Process Batch with Retry ----
+async function processBatch(domains, headers, stats, streams, retryAttempt = 0) {
+  const failedDomains = [];
+  let rateLimitCount = 0;
+  
+  await runPool(domains, async (domain, index, consecutiveRateLimits) => {
+    const i = index + 1;
+    const currentHeaders = await getPhantomHeaders();
+    const result = await checkPhantom(domain, currentHeaders);
+
+    stats.processed++;
+    const elapsed = ((Date.now() - stats.startTime) / 1000).toFixed(1);
+    const rate = (stats.processed / (Date.now() - stats.startTime) * 1000).toFixed(1);
+
+    if (["error", "rate_limited", "api_error"].includes(result)) {
+      const retryLabel = retryAttempt > 0 ? ` [Retry ${retryAttempt}]` : "";
+      console.log(`[${i}/${domains.length}] ⚠ FAILED${retryLabel} → ${domain} (${rate}/s)`);
+      
+      failedDomains.push(domain);
+      
+      if (result === "rate_limited") {
+        rateLimitCount++;
+        // Exponential backoff based on consecutive rate limits
+        const backoffTime = Math.min(60000, 10000 * Math.pow(1.5, consecutiveRateLimits));
+        console.log(`⏸️  Rate limit hit (${rateLimitCount}), backing off for ${(backoffTime/1000).toFixed(1)}s...`);
+        await sleep(backoffTime);
+      }
+      return result;
+    }
+
+    if (result === "whitelisted") {
+      stats.whitelisted++;
+      console.log(`[${i}/${domains.length}] ✅ WL → ${domain} (${rate}/s)`);
+      await streams.wlStream.appendFile(domain + "\n");
+      sendTelegramNotification(domain).catch(() => {});
+    } else if (result === "blocked") {
+      stats.blocked++;
+      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain} (${rate}/s)`);
+      await streams.blockStream.appendFile(domain + "\n");
+    } else {
+      console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain} (${rate}/s)`);
+    }
+    
+    return result;
+
+  }, MAX_CONCURRENCY, REQUEST_DELAY);
+
+  return failedDomains;
+}
+
 // ---- Main ----
 async function main() {
-  // Initial header fetch
   let headers = await getPhantomHeaders(true);
 
-  // Setup automatic header refresh every 10 minutes
   const headerRefreshTimer = setInterval(async () => {
     try {
       headers = await getPhantomHeaders(true);
@@ -231,74 +295,57 @@ async function main() {
   const domains = raw.split("\n").map(normalizeDomain).filter(Boolean);
 
   console.log(`🚀 Scanning ${domains.length} domains with ${MAX_CONCURRENCY} concurrent requests...\n`);
+  console.log(`⚙️  Settings: ${REQUEST_DELAY}ms delay, ${REQUEST_TIMEOUT}ms timeout, ${MAX_RETRIES} retries\n`);
 
-  const wlStream = await fs.open("whitelisted.txt", "a");
-  const blockStream = await fs.open("blocked.txt", "a");
-  const failedStream = await fs.open("failed.txt", "a");
+  const streams = {
+    wlStream: await fs.open("whitelisted.txt", "a"),
+    blockStream: await fs.open("blocked.txt", "a"),
+    failedStream: await fs.open("failed.txt", "a")
+  };
 
-  const startTime = Date.now();
-  let processed = 0;
-  let whitelisted = 0;
-  let blocked = 0;
-  let failed = 0;
+  const stats = {
+    startTime: Date.now(),
+    processed: 0,
+    whitelisted: 0,
+    blocked: 0,
+    totalFailed: 0
+  };
 
-  await runPool(domains, async (domain, index) => {
-    const i = index + 1;
+  // Initial scan
+  let failedDomains = await processBatch(domains, headers, stats, streams, 0);
+
+  // Retry failed domains
+  for (let attempt = 1; attempt <= MAX_RETRIES && failedDomains.length > 0; attempt++) {
+    console.log(`\n🔄 Retrying ${failedDomains.length} failed domains (Attempt ${attempt}/${MAX_RETRIES})...\n`);
+    await sleep(5000); // Wait 5 seconds before retry
     
-    // Always get current headers (will use cache if fresh)
-    const currentHeaders = await getPhantomHeaders();
-    const result = await checkPhantom(domain, currentHeaders);
+    failedDomains = await processBatch(failedDomains, headers, stats, streams, attempt);
+  }
 
-    processed++;
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    const rate = (processed / (Date.now() - startTime) * 1000).toFixed(1);
-
-    if (["error", "rate_limited", "api_error"].includes(result)) {
-      failed++;
-      console.log(`[${i}/${domains.length}] ⚠ FAILED → ${domain} (${rate}/s)`);
-      await failedStream.appendFile(domain + "\n");
-      
-      // Only sleep if rate limited
-      if (result === "rate_limited") {
-        await sleep(30000); // 10 second delay on rate limit
-      }
-      return;
-    }
-
-    if (result === "whitelisted") {
-      whitelisted++;
-      console.log(`[${i}/${domains.length}] ✅ WL → ${domain} (${rate}/s)`);
-      await wlStream.appendFile(domain + "\n");
-      // Send Telegram notification (non-blocking)
-      sendTelegramNotification(domain).catch(() => {});
-    } else if (result === "blocked") {
-      blocked++;
-      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain} (${rate}/s)`);
-      await blockStream.appendFile(domain + "\n");
-    } else {
-      console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain} (${rate}/s)`);
-    }
-
-  }, MAX_CONCURRENCY);
+  // Write permanently failed domains
+  for (const domain of failedDomains) {
+    await streams.failedStream.appendFile(domain + "\n");
+  }
+  stats.totalFailed = failedDomains.length;
 
   // Cleanup
   clearInterval(headerRefreshTimer);
-  await wlStream.close();
-  await blockStream.close();
-  await failedStream.close();
+  await streams.wlStream.close();
+  await streams.blockStream.close();
+  await streams.failedStream.close();
 
-  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-  const avgRate = (processed / (Date.now() - startTime) * 1000).toFixed(1);
+  const totalTime = ((Date.now() - stats.startTime) / 1000).toFixed(1);
+  const avgRate = (stats.processed / (Date.now() - stats.startTime) * 1000).toFixed(1);
 
   console.log("\n" + "=".repeat(60));
   console.log("✔ SCAN COMPLETE");
   console.log("=".repeat(60));
   console.log(`⏱️  Total time: ${totalTime}s`);
   console.log(`⚡ Average rate: ${avgRate} domains/second`);
-  console.log(`📊 Processed: ${processed}/${domains.length}`);
-  console.log(`✅ Whitelisted: ${whitelisted}`);
-  console.log(`🚫 Blocked: ${blocked}`);
-  console.log(`⚠️  Failed: ${failed}`);
+  console.log(`📊 Processed: ${stats.processed}/${domains.length}`);
+  console.log(`✅ Whitelisted: ${stats.whitelisted}`);
+  console.log(`🚫 Blocked: ${stats.blocked}`);
+  console.log(`⚠️  Failed (after ${MAX_RETRIES} retries): ${stats.totalFailed}`);
   console.log("=".repeat(60));
 }
 
@@ -306,4 +353,3 @@ main().catch(error => {
   console.error("Fatal error:", error);
   process.exit(1);
 });
-
