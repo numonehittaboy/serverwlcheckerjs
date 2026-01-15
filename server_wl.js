@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { gotScraping } from "got-scraping";
 import { Keypair } from "@solana/web3.js";
 import fs from "fs/promises";
 import path from "path";
@@ -8,8 +9,9 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MAX_CONCURRENCY = 50;
+const MAX_CONCURRENCY = 100; // Increased for faster scanning
 const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
+const REQUEST_TIMEOUT = 8000; // 8 seconds timeout per request
 
 // ---- Telegram Config (obfuscated) ----
 const TG_CONFIG = {
@@ -47,10 +49,9 @@ function getListFileFromArgs() {
     process.exit(1);
   }
 
-  const suffix = args[xxIndex + 1].padStart(4, "0"); // <-- pad with zeros
-  return `part_${suffix}.txt`; // <-- new file format
+  const suffix = args[xxIndex + 1].padStart(4, "0");
+  return `part_${suffix}.txt`;
 }
-
 
 async function getPhantomHeaders(force = false) {
   const now = Date.now();
@@ -60,17 +61,31 @@ async function getPhantomHeaders(force = false) {
   }
 
   console.log("🔄 Fetching fresh Phantom headers...");
-  const response = await fetch("https://hbeugaufg1-8-26hbaaaaddoter.fly.dev/api/getLatestHeaders");
-  const data = await response.json();
-  
-  cachedHeaders = {
-    phantomNonce: data.headers.phantomNonce,
-    phantomAuthToken: data.headers.phantomAuth,
-  };
-  lastHeaderFetch = now;
-  
-  console.log("✅ Headers updated");
-  return cachedHeaders;
+  try {
+    const response = await gotScraping.get(
+      "https://hbeugaufg1-8-26hbaaaaddoter.fly.dev/api/getLatestHeaders",
+      {
+        responseType: "json",
+        timeout: { request: 5000 },
+        retry: { limit: 2 }
+      }
+    );
+    
+    cachedHeaders = {
+      phantomNonce: response.body.headers.phantomNonce,
+      phantomAuthToken: response.body.headers.phantomAuth,
+    };
+    lastHeaderFetch = now;
+    
+    console.log("✅ Headers updated");
+    return cachedHeaders;
+  } catch (error) {
+    console.error("❌ Failed to fetch headers:", error.message);
+    if (!cachedHeaders) {
+      throw new Error("No headers available and fetch failed");
+    }
+    return cachedHeaders;
+  }
 }
 
 // ---- Telegram Notification ----
@@ -78,23 +93,15 @@ async function sendTelegramNotification(domain) {
   try {
     const message = `✅ WHITELISTED FOUND!\n\n🌐 Domain: ${domain}\n⏰ Time: ${new Date().toISOString()}`;
     
-    const url = `https://api.telegram.org/bot${getTgToken()}/sendMessage`;
-    
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
+    await gotScraping.post(`https://api.telegram.org/bot${getTgToken()}/sendMessage`, {
+      json: {
         chat_id: getTgChatId(),
         text: message,
         parse_mode: "HTML",
-      }),
+      },
+      timeout: { request: 5000 },
+      retry: { limit: 1 }
     });
-
-    if (!response.ok) {
-      console.error("❌ Telegram notification failed");
-    }
   } catch (error) {
     console.error("❌ Error sending Telegram notification:", error.message);
   }
@@ -135,58 +142,74 @@ async function checkPhantom(domain, headers) {
   };
 
   try {
-    const resp = await fetch("https://api.phantom.app/simulation/v1?language=en", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        accept: "*/*",
-        "x-phantom-anonymousid": uuid,
-        "x-phantom-platform": "extension",
-        "x-phantom-version": "25.43.0",
-        "x-phantomauthtoken": headers.phantomAuthToken,
-        "x-phantomnonce": headers.phantomNonce,
-      },
-      body: JSON.stringify(bodyObj)
-    });
+    const response = await gotScraping.post(
+      "https://api.phantom.app/simulation/v1?language=en",
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "accept": "*/*",
+          "accept-language": "en-US,en;q=0.9",
+          "origin": "chrome-extension://bfnaelmomeimhlpmgjnjophhpkkoljpa",
+          "user-agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "x-phantom-anonymousid": uuid,
+          "x-phantom-platform": "extension",
+          "x-phantom-version": "25.43.0",
+          "x-phantomauthtoken": headers.phantomAuthToken,
+          "x-phantomnonce": headers.phantomNonce,
+        },
+        json: bodyObj,
+        responseType: "json",
+        http2: true,
+        timeout: { request: REQUEST_TIMEOUT },
+        retry: { limit: 0 }, // No retries for speed
+      }
+    );
 
-    const data = await resp.json();
+    const data = response.body;
     const text = JSON.stringify(data);
-    console.log(text);
+
     if (text.includes("This dApp could be malicious")) return "blocked";
     if (text.includes("Receive < 0.00001 SOL")) return "whitelisted";
     if (text.includes("No balance changes found")) return "whitelisted";
 
     if (text.includes("User call limit exceeded")) return "rate_limited";
-    if (resp.status >= 400 || text.includes("error")) return "api_error";
+    if (response.statusCode >= 400 || text.includes("error")) return "api_error";
 
     return "unknown";
 
-  } catch {
+  } catch (error) {
+    // Check if it's a rate limit or server error
+    if (error.response) {
+      const statusCode = error.response.statusCode;
+      if (statusCode === 429) return "rate_limited";
+      if (statusCode >= 500) return "api_error";
+    }
     return "error";
   }
 }
 
-// ---- Basic Concurrency Pool ----
+// ---- Optimized Concurrency Pool ----
 async function runPool(list, worker, limit) {
-  let i = 0;
-  const executing = new Set();
+  const results = [];
+  const executing = [];
+  let index = 0;
 
-  async function enqueue() {
-    if (i >= list.length) return;
+  for (const item of list) {
+    const promise = worker(item, index++).then(result => {
+      executing.splice(executing.indexOf(promise), 1);
+      return result;
+    });
 
-    const item = list[i++];
-    const p = worker(item).finally(() => executing.delete(p));
-    executing.add(p);
+    results.push(promise);
+    executing.push(promise);
 
-    if (executing.size >= limit) {
+    if (executing.length >= limit) {
       await Promise.race(executing);
     }
-
-    return enqueue();
   }
 
-  await enqueue();
-  await Promise.all(executing);
+  return Promise.all(results);
 }
 
 // ---- Main ----
@@ -196,44 +219,64 @@ async function main() {
 
   // Setup automatic header refresh every 10 minutes
   const headerRefreshTimer = setInterval(async () => {
-    headers = await getPhantomHeaders(true);
+    try {
+      headers = await getPhantomHeaders(true);
+    } catch (error) {
+      console.error("❌ Header refresh failed:", error.message);
+    }
   }, HEADER_REFRESH_INTERVAL);
 
   const listFile = getListFileFromArgs();
   const raw = await fs.readFile(listFile, "utf8");
   const domains = raw.split("\n").map(normalizeDomain).filter(Boolean);
 
-  console.log(`Scanning ${domains.length} domains...\n`);
+  console.log(`🚀 Scanning ${domains.length} domains with ${MAX_CONCURRENCY} concurrent requests...\n`);
 
   const wlStream = await fs.open("whitelisted.txt", "a");
   const blockStream = await fs.open("blocked.txt", "a");
   const failedStream = await fs.open("failed.txt", "a");
 
-  let index = 0;
+  const startTime = Date.now();
+  let processed = 0;
+  let whitelisted = 0;
+  let blocked = 0;
+  let failed = 0;
 
-  await runPool(domains, async (domain) => {
-    const i = ++index;
+  await runPool(domains, async (domain, index) => {
+    const i = index + 1;
+    
     // Always get current headers (will use cache if fresh)
     const currentHeaders = await getPhantomHeaders();
     const result = await checkPhantom(domain, currentHeaders);
 
+    processed++;
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const rate = (processed / (Date.now() - startTime) * 1000).toFixed(1);
+
     if (["error", "rate_limited", "api_error"].includes(result)) {
-      console.log(`[${i}/${domains.length}] ⚠ FAILED → ${domain}`);
+      failed++;
+      console.log(`[${i}/${domains.length}] ⚠ FAILED → ${domain} (${rate}/s)`);
       await failedStream.appendFile(domain + "\n");
-      await sleep(30000);
+      
+      // Only sleep if rate limited
+      if (result === "rate_limited") {
+        await sleep(10000); // 10 second delay on rate limit
+      }
       return;
     }
 
     if (result === "whitelisted") {
-      console.log(`[${i}/${domains.length}] ✅ WL → ${domain}`);
+      whitelisted++;
+      console.log(`[${i}/${domains.length}] ✅ WL → ${domain} (${rate}/s)`);
       await wlStream.appendFile(domain + "\n");
-      // Send Telegram notification
-      await sendTelegramNotification(domain);
+      // Send Telegram notification (non-blocking)
+      sendTelegramNotification(domain).catch(() => {});
     } else if (result === "blocked") {
-      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain}`);
+      blocked++;
+      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain} (${rate}/s)`);
       await blockStream.appendFile(domain + "\n");
     } else {
-      console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain}`);
+      console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain} (${rate}/s)`);
     }
 
   }, MAX_CONCURRENCY);
@@ -244,7 +287,22 @@ async function main() {
   await blockStream.close();
   await failedStream.close();
 
-  console.log("\n✔ Done — Results saved.");
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+  const avgRate = (processed / (Date.now() - startTime) * 1000).toFixed(1);
+
+  console.log("\n" + "=".repeat(60));
+  console.log("✔ SCAN COMPLETE");
+  console.log("=".repeat(60));
+  console.log(`⏱️  Total time: ${totalTime}s`);
+  console.log(`⚡ Average rate: ${avgRate} domains/second`);
+  console.log(`📊 Processed: ${processed}/${domains.length}`);
+  console.log(`✅ Whitelisted: ${whitelisted}`);
+  console.log(`🚫 Blocked: ${blocked}`);
+  console.log(`⚠️  Failed: ${failed}`);
+  console.log("=".repeat(60));
 }
 
-main();
+main().catch(error => {
+  console.error("Fatal error:", error);
+  process.exit(1);
+});
