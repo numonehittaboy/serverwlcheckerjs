@@ -9,11 +9,11 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MAX_CONCURRENCY = 35; // Reduced from 50 to avoid rate limits
+const MAX_CONCURRENCY = 45; // Reduced from 50 to avoid rate limits
 const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000;
 const REQUEST_TIMEOUT = 10000; // Increased to 10 seconds
 const MAX_RETRIES = 3; // Number of retry attempts
-const REQUEST_DELAY = 100; // 100ms delay between requests (adaptive)
+const REQUEST_DELAY = 80; // 100ms delay between requests (adaptive)
 
 // ---- Telegram Config (obfuscated) ----
 const TG_CONFIG = {
@@ -353,3 +353,4 @@ main().catch(error => {
   console.error("Fatal error:", error);
   process.exit(1);
 });
+
