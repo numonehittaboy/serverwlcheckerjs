@@ -9,11 +9,80 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MAX_CONCURRENCY = 15; // Reduced from 50 to avoid rate limits
+// Adaptive settings - will auto-tune
+let MAX_CONCURRENCY = 30; // Start moderate
+const MIN_CONCURRENCY = 5;
+const MAX_CONCURRENCY_LIMIT = 80;
 const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000;
-const REQUEST_TIMEOUT = 10000; // Increased to 10 seconds
-const MAX_RETRIES = 3; // Number of retry attempts
-const REQUEST_DELAY = 100; // 100ms delay between requests (adaptive)
+const REQUEST_TIMEOUT = 10000;
+const MAX_RETRIES = 2;
+
+// Adaptive speed controller
+const speedController = {
+  successWindow: [],
+  failureWindow: [],
+  windowSize: 50, // Last 50 requests
+  lastAdjustment: Date.now(),
+  adjustmentInterval: 5000, // Adjust every 5 seconds
+  
+  recordSuccess() {
+    this.successWindow.push(Date.now());
+    if (this.successWindow.length > this.windowSize) {
+      this.successWindow.shift();
+    }
+  },
+  
+  recordFailure() {
+    this.failureWindow.push(Date.now());
+    if (this.failureWindow.length > this.windowSize) {
+      this.failureWindow.shift();
+    }
+  },
+  
+  getSuccessRate() {
+    const total = this.successWindow.length + this.failureWindow.length;
+    if (total === 0) return 1;
+    return this.successWindow.length / total;
+  },
+  
+  shouldAdjust() {
+    return Date.now() - this.lastAdjustment > this.adjustmentInterval;
+  },
+  
+  adjustConcurrency() {
+    if (!this.shouldAdjust()) return;
+    
+    const successRate = this.getSuccessRate();
+    const oldConcurrency = MAX_CONCURRENCY;
+    
+    // Success rate > 90% = speed up
+    if (successRate > 0.90 && MAX_CONCURRENCY < MAX_CONCURRENCY_LIMIT) {
+      MAX_CONCURRENCY = Math.min(MAX_CONCURRENCY_LIMIT, Math.ceil(MAX_CONCURRENCY * 1.3));
+      console.log(`🚀 Speed UP: ${oldConcurrency} → ${MAX_CONCURRENCY} (success: ${(successRate*100).toFixed(1)}%)`);
+    }
+    // Success rate < 70% = slow down
+    else if (successRate < 0.70 && MAX_CONCURRENCY > MIN_CONCURRENCY) {
+      MAX_CONCURRENCY = Math.max(MIN_CONCURRENCY, Math.floor(MAX_CONCURRENCY * 0.6));
+      console.log(`🐌 Speed DOWN: ${oldConcurrency} → ${MAX_CONCURRENCY} (success: ${(successRate*100).toFixed(1)}%)`);
+    }
+    // Success rate 70-90% = optimal, maybe slight adjustment
+    else if (successRate >= 0.80 && successRate <= 0.85 && MAX_CONCURRENCY < MAX_CONCURRENCY_LIMIT) {
+      MAX_CONCURRENCY = Math.min(MAX_CONCURRENCY_LIMIT, MAX_CONCURRENCY + 2);
+      console.log(`⚡ Fine-tune UP: ${oldConcurrency} → ${MAX_CONCURRENCY} (success: ${(successRate*100).toFixed(1)}%)`);
+    }
+    
+    this.lastAdjustment = Date.now();
+  },
+  
+  getStats() {
+    return {
+      successRate: this.getSuccessRate(),
+      concurrency: MAX_CONCURRENCY,
+      recentSuccesses: this.successWindow.length,
+      recentFailures: this.failureWindow.length
+    };
+  }
+};
 
 // ---- Telegram Config (obfuscated) ----
 const TG_CONFIG = {
@@ -190,38 +259,45 @@ async function checkPhantom(domain, headers) {
   }
 }
 
-// ---- Optimized Concurrency Pool with Adaptive Delay ----
-async function runPool(list, worker, limit, delayMs = 0) {
+// ---- Adaptive Concurrency Pool ----
+async function runPool(list, worker) {
   const results = [];
-  const executing = [];
+  const executing = new Set();
   let index = 0;
   let consecutiveRateLimits = 0;
 
   for (const item of list) {
-    const promise = worker(item, index++, consecutiveRateLimits).then(result => {
-      executing.splice(executing.indexOf(promise), 1);
+    // Adaptive adjustment
+    speedController.adjustConcurrency();
+    
+    const promise = (async () => {
+      const result = await worker(item, index++);
       
-      // Track rate limits for adaptive slowing
-      if (result === "rate_limited") {
-        consecutiveRateLimits++;
-      } else if (result !== "error") {
+      // Track success/failure for adaptive control
+      if (result === "rate_limited" || result === "error" || result === "api_error") {
+        speedController.recordFailure();
+        if (result === "rate_limited") {
+          consecutiveRateLimits++;
+          // Immediate slowdown on rate limit
+          const backoffTime = Math.min(30000, 5000 * Math.pow(1.5, consecutiveRateLimits));
+          console.log(`⏸️  Rate limit! Backing off ${(backoffTime/1000).toFixed(1)}s...`);
+          await sleep(backoffTime);
+        }
+      } else {
+        speedController.recordSuccess();
         consecutiveRateLimits = Math.max(0, consecutiveRateLimits - 1);
       }
       
+      executing.delete(promise);
       return result;
-    });
+    })();
 
     results.push(promise);
-    executing.push(promise);
+    executing.add(promise);
 
-    if (executing.length >= limit) {
+    // Dynamic concurrency limit
+    if (executing.size >= MAX_CONCURRENCY) {
       await Promise.race(executing);
-    }
-    
-    // Adaptive delay - slow down if hitting rate limits
-    if (delayMs > 0) {
-      const adaptiveDelay = delayMs * (1 + consecutiveRateLimits * 0.5);
-      await sleep(adaptiveDelay);
     }
   }
 
@@ -231,9 +307,8 @@ async function runPool(list, worker, limit, delayMs = 0) {
 // ---- Process Batch with Retry ----
 async function processBatch(domains, headers, stats, streams, retryAttempt = 0) {
   const failedDomains = [];
-  let rateLimitCount = 0;
   
-  await runPool(domains, async (domain, index, consecutiveRateLimits) => {
+  await runPool(domains, async (domain, index) => {
     const i = index + 1;
     const currentHeaders = await getPhantomHeaders();
     const result = await checkPhantom(domain, currentHeaders);
@@ -241,39 +316,31 @@ async function processBatch(domains, headers, stats, streams, retryAttempt = 0) 
     stats.processed++;
     const elapsed = ((Date.now() - stats.startTime) / 1000).toFixed(1);
     const rate = (stats.processed / (Date.now() - stats.startTime) * 1000).toFixed(1);
+    const speedStats = speedController.getStats();
 
     if (["error", "rate_limited", "api_error"].includes(result)) {
       const retryLabel = retryAttempt > 0 ? ` [Retry ${retryAttempt}]` : "";
-      console.log(`[${i}/${domains.length}] ⚠ FAILED${retryLabel} → ${domain} (${rate}/s)`);
+      console.log(`[${i}/${domains.length}] ⚠ FAILED${retryLabel} → ${domain} | ${rate}/s | Concur: ${speedStats.concurrency} | Success: ${(speedStats.successRate*100).toFixed(0)}%`);
       
       failedDomains.push(domain);
-      
-      if (result === "rate_limited") {
-        rateLimitCount++;
-        // Exponential backoff based on consecutive rate limits
-        const backoffTime = Math.min(60000, 10000 * Math.pow(1.5, consecutiveRateLimits));
-        console.log(`⏸️  Rate limit hit (${rateLimitCount}), backing off for ${(backoffTime/1000).toFixed(1)}s...`);
-        await sleep(backoffTime);
-      }
       return result;
     }
 
     if (result === "whitelisted") {
       stats.whitelisted++;
-      console.log(`[${i}/${domains.length}] ✅ WL → ${domain} (${rate}/s)`);
+      console.log(`[${i}/${domains.length}] ✅ WL → ${domain} | ${rate}/s | Concur: ${speedStats.concurrency}`);
       await streams.wlStream.appendFile(domain + "\n");
       sendTelegramNotification(domain).catch(() => {});
     } else if (result === "blocked") {
       stats.blocked++;
-      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain} (${rate}/s)`);
+      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain} | ${rate}/s`);
       await streams.blockStream.appendFile(domain + "\n");
     } else {
-      console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain} (${rate}/s)`);
+      console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain} | ${rate}/s`);
     }
     
     return result;
-
-  }, MAX_CONCURRENCY, REQUEST_DELAY);
+  });
 
   return failedDomains;
 }
@@ -294,8 +361,9 @@ async function main() {
   const raw = await fs.readFile(listFile, "utf8");
   const domains = raw.split("\n").map(normalizeDomain).filter(Boolean);
 
-  console.log(`🚀 Scanning ${domains.length} domains with ${MAX_CONCURRENCY} concurrent requests...\n`);
-  console.log(`⚙️  Settings: ${REQUEST_DELAY}ms delay, ${REQUEST_TIMEOUT}ms timeout, ${MAX_RETRIES} retries\n`);
+  console.log(`🚀 Starting adaptive scan of ${domains.length} domains`);
+  console.log(`⚙️  Initial concurrency: ${MAX_CONCURRENCY} (will auto-adjust between ${MIN_CONCURRENCY}-${MAX_CONCURRENCY_LIMIT})`);
+  console.log(`📊 System will speed up when success rate > 90%, slow down when < 70%\n`);
 
   const streams = {
     wlStream: await fs.open("whitelisted.txt", "a"),
@@ -317,7 +385,12 @@ async function main() {
   // Retry failed domains
   for (let attempt = 1; attempt <= MAX_RETRIES && failedDomains.length > 0; attempt++) {
     console.log(`\n🔄 Retrying ${failedDomains.length} failed domains (Attempt ${attempt}/${MAX_RETRIES})...\n`);
-    await sleep(5000); // Wait 5 seconds before retry
+    await sleep(10000); // Wait 10 seconds before retry
+    
+    // Reset speed controller for retry batch
+    speedController.successWindow = [];
+    speedController.failureWindow = [];
+    MAX_CONCURRENCY = 20; // Start retries slower
     
     failedDomains = await processBatch(failedDomains, headers, stats, streams, attempt);
   }
@@ -336,17 +409,20 @@ async function main() {
 
   const totalTime = ((Date.now() - stats.startTime) / 1000).toFixed(1);
   const avgRate = (stats.processed / (Date.now() - stats.startTime) * 1000).toFixed(1);
+  const finalStats = speedController.getStats();
 
-  console.log("\n" + "=".repeat(60));
+  console.log("\n" + "=".repeat(70));
   console.log("✔ SCAN COMPLETE");
-  console.log("=".repeat(60));
+  console.log("=".repeat(70));
   console.log(`⏱️  Total time: ${totalTime}s`);
   console.log(`⚡ Average rate: ${avgRate} domains/second`);
+  console.log(`🎯 Final concurrency: ${finalStats.concurrency}`);
+  console.log(`📈 Final success rate: ${(finalStats.successRate*100).toFixed(1)}%`);
   console.log(`📊 Processed: ${stats.processed}/${domains.length}`);
   console.log(`✅ Whitelisted: ${stats.whitelisted}`);
   console.log(`🚫 Blocked: ${stats.blocked}`);
   console.log(`⚠️  Failed (after ${MAX_RETRIES} retries): ${stats.totalFailed}`);
-  console.log("=".repeat(60));
+  console.log("=".repeat(70));
 }
 
 main().catch(error => {
