@@ -9,7 +9,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const MAX_CONCURRENCY = 100; // Increased for faster scanning
+const MAX_CONCURRENCY = 50; // Increased for faster scanning
 const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000; // 10 minutes
 const REQUEST_TIMEOUT = 8000; // 8 seconds timeout per request
 
@@ -260,7 +260,7 @@ async function main() {
       
       // Only sleep if rate limited
       if (result === "rate_limited") {
-        await sleep(10000); // 10 second delay on rate limit
+        await sleep(30000); // 10 second delay on rate limit
       }
       return;
     }
@@ -306,3 +306,4 @@ main().catch(error => {
   console.error("Fatal error:", error);
   process.exit(1);
 });
+
